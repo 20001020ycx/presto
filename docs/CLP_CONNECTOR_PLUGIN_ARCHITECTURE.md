@@ -1,167 +1,104 @@
-# CLP Velox Connector Plugin Architecture
+# CLP Connector Plugin Architecture
 
 ## Table of Contents
 
-1. [Repository Ownership Summary](#repository-ownership-summary)
-2. [Terminology and Glossary](#terminology-and-glossary)
-3. [Overview](#overview)
-4. [Motivation](#motivation)
-5. [Prerequisites](#prerequisites)
-6. [Architecture](#architecture)
-   - [Current Architecture](#current-architecture)
-   - [Plugin Architecture](#plugin-architecture)
+1. [Overview](#overview)
+2. [Terminology](#terminology)
+3. [Architecture](#architecture)
+   - [Current Architecture (Static Linking)](#current-architecture-static-linking)
+     - [Why This Is Problematic](#why-this-is-problematic)
+   - [Proposed Architecture (Plugin Loading)](#proposed-architecture-plugin-loading)
    - [Data Flow](#data-flow)
-7. [What PR #26650 Provides](#what-pr-26650-provides)
-8. [Implementation Plan](#implementation-plan)
-   - [Step 1: Create Plugin Directory Structure [PRESTO]](#step-1-create-plugin-directory-structure-presto)
-   - [Step 2: Extract ClpPrestoToVeloxConnector [PRESTO]](#step-2-extract-clpprestotoveloxconnector-presto)
-   - [Step 3: Create Plugin Entry Point [PRESTO]](#step-3-create-plugin-entry-point-presto)
-   - [Step 4: Create Plugin CMakeLists.txt [PRESTO]](#step-4-create-plugin-cmakeliststxt-presto)
-   - [Step 5: Remove CLP from Static Build [PRESTO]](#step-5-remove-clp-from-static-build-presto)
-9. [File Reference](#file-reference)
-10. [Build Instructions](#build-instructions)
-11. [Deployment](#deployment)
-12. [Verification](#verification)
-
----
-
-## Repository Ownership Summary
-
-This section clarifies which changes go to which repository for upstream review.
-
-### Change Classification
-
-| Tag | Repository | Upstream Target | Description |
-|-----|------------|-----------------|-------------|
-| **[PRESTO]** | `presto-native-execution/presto_cpp/` | `prestodb/presto` | Changes to Presto C++ worker code. Submit for Presto reviewer. |
-| **[VELOX]** | `presto-native-execution/velox/` | Private repo (y-scope/velox) | Changes to Velox connector code. Stays in private fork. |
-
-### Summary of Changes by Repository
-
-**[PRESTO] - To be upstreamed to prestodb/presto:**
-- `presto_cpp/main/connectors/clp_plugin/` (new directory - Steps 1-4)
-- `presto_cpp/main/connectors/Registration.cpp` (remove CLP registration - Step 5.1)
-- `presto_cpp/main/connectors/PrestoToVeloxConnector.h` (remove CLP class - Step 5.2)
-- `presto_cpp/main/connectors/PrestoToVeloxConnector.cpp` (remove CLP implementation - Step 5.3)
-- `presto_cpp/main/connectors/CMakeLists.txt` (remove CLP links - Step 5.4)
-- `presto_cpp/main/CMakeLists.txt` (remove velox_clp_connector - Step 5.5)
-- `presto_cpp/presto_protocol/presto_protocol.cpp` (remove CLP include - Step 5.6)
-- `presto_cpp/presto_protocol/connector/clp/` (CLP protocol types - referenced, no changes)
-
-**[VELOX] - Private repo (no upstream):**
-- `velox/velox/connectors/clp/` (Velox CLP connector - referenced, no changes needed)
-- `velox/velox/connectors/clp/search_lib/` (CLP search library - referenced, no changes needed)
-
----
-
-## Terminology and Glossary
-
-This section defines key terms used throughout this document. The term "CLP connector" can be ambiguous because there are components in both Presto (Java) and Velox (C++) sides.
-
-### Core Components
-
-| Term | Definition | Location | Repository |
-|------|------------|----------|------------|
-| **Presto CLP Connector (Java)** | The Java-side connector that runs in the Presto Coordinator. Handles metadata, split generation, and query planning. | `presto-clp/` module in Presto Java codebase | **[PRESTO]** |
-| **Velox CLP Connector (C++)** | The C++ connector that runs in the Presto Worker (Velox). Reads data from CLP archives/IR files. | `velox/velox/connectors/clp/` | **[VELOX]** |
-| **CLP Plugin** | The `.so` shared library we are creating. Contains Velox CLP Connector + bridge code. | `presto_cpp/main/connectors/clp_plugin/` | **[PRESTO]** |
-
-### Bridge Components
-
-| Term | Definition | Location |
-|------|------------|----------|
-| **ClpPrestoToVeloxConnector** | Bridge class that converts Presto protocol types to Velox connector types. | `presto_cpp/main/connectors/PrestoToVeloxConnector.cpp` |
-| **ClpConnectorProtocol** | JSON serialization/deserialization for CLP-specific types (Split, ColumnHandle, TableHandle). | `presto_cpp/presto_protocol/connector/clp/ClpConnectorProtocol.h` |
-| **presto_protocol_clp** | Generated C++ types matching Java-side CLP connector types for JSON serialization. | `presto_cpp/presto_protocol/connector/clp/presto_protocol_clp.h/cpp` |
-
-### Velox CLP Connector Classes
-
-| Term | Definition | Purpose |
-|------|------------|---------|
-| **ClpConnector** | Main Velox connector class. Implements `Connector` interface. | Creates `ClpDataSource` instances for query execution |
-| **ClpConnectorFactory** | Factory class that creates `ClpConnector` instances. | Registered with Velox connector registry |
-| **ClpDataSource** | Reads data from CLP splits. Implements `DataSource` interface. | Orchestrates cursor creation and row fetching |
-| **ClpConnectorSplit** | Describes a unit of work (archive file or IR stream). | Contains path, split type, and optional KQL query |
-| **ClpTableHandle** | Represents the CLP table being queried. | Contains connector ID and table name |
-| **ClpColumnHandle** | Represents a column in the CLP table. | Contains column name, original name, and type |
-
-### Protocol Types (Java ↔ C++ Communication)
-
-| Term | Definition | Side |
-|------|------------|------|
-| **protocol::clp::ClpSplit** | C++ protocol type matching Java `ClpSplit`. | C++ (deserialized from JSON) |
-| **protocol::clp::ClpColumnHandle** | C++ protocol type matching Java `ClpColumnHandle`. | C++ (deserialized from JSON) |
-| **protocol::clp::ClpTableLayoutHandle** | C++ protocol type matching Java `ClpTableLayoutHandle`. | C++ (deserialized from JSON) |
-
-### Search Library Components
-
-| Term | Definition | Location |
-|------|------------|----------|
-| **clp-s** | YScope's CLP library for reading compressed log archives. | External dependency |
-| **ClpArchiveCursor** | Reads data from CLP archive format. | `velox/connectors/clp/search_lib/archive/` |
-| **ClpIrCursor** | Reads data from CLP IR (Intermediate Representation) format. | `velox/connectors/clp/search_lib/ir/` |
-| **BaseClpCursor** | Abstract base class for cursors. Defines query execution interface. | `velox/connectors/clp/search_lib/BaseClpCursor.h` |
-
-### Registration Functions
-
-| Term | Definition |
-|------|------------|
-| **registerConnectorFactory()** | Velox function to register a `ConnectorFactory` with the Velox connector registry. |
-| **registerPrestoToVeloxConnector()** | Presto C++ function to register a `PrestoToVeloxConnector` with the bridge registry. |
-| **registerExtensions()** | Plugin entry point function called by `presto_server` after `dlopen()`. |
-
-### CMake Library Types
-
-| Term | Definition |
-|------|------------|
-| **OBJECT library** | CMake library that compiles to `.o` files but isn't linked into an archive. Must use `$<TARGET_OBJECTS:>` to link. |
-| **STATIC library** | CMake library that compiles to a `.a` archive file. |
-| **SHARED library** | CMake library that compiles to a `.so` (Linux) or `.dylib` (macOS) shared library. |
+   - [Component Details](#component-details)
+4. [Implementation Plan](#implementation-plan)
+   - [File Reference Summary](#file-reference-summary)
+   - [Part 1: Plugin Loading Infrastructure (Upstream to Presto)](#part-1-plugin-loading-infrastructure-upstream-to-presto)
+   - [Part 2: CLP Connector Plugin (Private Distribution)](#part-2-clp-connector-plugin-private-distribution)
+5. [Build Instructions](#build-instructions)
+6. [Deployment](#deployment)
+7. [Verification](#verification)
 
 ---
 
 ## Overview
 
-This document describes the architecture and implementation procedure for converting the **Velox CLP Connector** into a dynamically loadable plugin (shared library `.so`). This allows the CLP connector to be distributed and loaded independently without requiring Presto to include the entire Velox CLP connector codebase in its build.
+This document describes how to distribute the CLP connector as a **standalone plugin library** that users can load into stock Presto without building Velox from scratch.
 
-The implementation follows [RFC-0019](https://github.com/prestodb/rfcs/blob/main/RFC-0019-connector-plugins.md) which defines the connector plugin infrastructure for Presto C++ workers.
+### Presto Architecture Background
 
-**What This Document Covers:**
-- Converting the C++ side (Velox CLP Connector) to a plugin
-- The Java side (Presto CLP Connector) remains unchanged
+Presto is a distributed SQL query engine with two main components:
+
+| Component | Language | Role |
+|-----------|----------|------|
+| **Presto Coordinator** | Java | Receives SQL queries, parses them, creates query plans, and distributes work to workers. Runs as a Java process. |
+| **Presto Worker** | Java or C++ | Executes the actual data processing. Can be either Java-based or native (C++) using Velox. |
+
+For native execution, the worker is called `presto_server`:
+
+| Component | Description |
+|-----------|-------------|
+| **`presto_server`** | The C++ native worker binary built from `presto-native-execution`. Uses Velox as the execution engine. Communicates with the Java Coordinator via HTTP/JSON. |
+| **Velox** | Meta's open-source C++ execution engine. Provides the runtime for query execution, including connectors for reading data. |
+
+**Communication flow:**
+```
+User SQL Query → Presto Coordinator (Java) → presto_server (C++/Velox) → Data Source
+```
+
+### Goal
+
+| Current State | Desired State |
+|---------------|---------------|
+| Users must pull private Velox fork | Users build stock Presto from upstream |
+| Users build entire Velox + Presto | YScope distributes `libclp_connector.so` |
+| CLP code embedded in `presto_server` | Plugin loaded at runtime via config |
+
+### Problem Summary
+
+Currently, the CLP connector is compiled directly into `presto_server` using CMake OBJECT libraries. This means:
+- The CLP source code must be present at build time
+- Users must clone the private Velox fork and build everything from scratch
+- **You cannot simply distribute a pre-built `presto_server` binary** because users may need different Presto configurations, versions, or custom modifications
+
+See [Current Architecture](#current-architecture-static-linking) for detailed explanation.
+
+### Current State of Presto Plugin Support
+
+> **Important:** As of this writing, Presto does NOT have plugin loading infrastructure for native (C++) connectors.
+
+| Component | Status | Details |
+|-----------|--------|---------|
+| **RFC-0019** | Design Only | [RFC-0019](https://github.com/prestodb/rfcs/blob/main/RFC-0019-connector-plugins.md) proposes connector plugins but is NOT implemented |
+| **PR #26650** | Merged | Adds **binary serialization codecs** for TPCH, NOT plugin loading |
+| **PR #26257** | Merged | Adds custom connector-provided serialization, NOT plugin loading |
+| **Plugin loading (`dlopen`)** | **NOT IMPLEMENTED** | Must be implemented as Part 1 of this plan |
+| **`plugin.dir` config** | **NOT IMPLEMENTED** | Must be implemented as Part 1 of this plan |
+
+### Approach
+
+The implementation has two parts:
+
+| Part | Repository | Purpose | Status |
+|------|------------|---------|--------|
+| **Part 1** | Upstream Presto (`prestodb/presto`) | Implement plugin loading infrastructure (`dlopen` + `plugin.dir` config) | **Must be implemented and upstreamed** |
+| **Part 2** | Private (YScope) | Build CLP connector as `.so` plugin | After Part 1 is merged |
+
+Once Part 1 is merged upstream, any Presto user can:
+1. Build `presto_server` from stock Presto
+2. Download `libclp_connector.so` from YScope
+3. Configure `plugin.dir` and run
 
 ---
 
-## Motivation
+## Terminology
 
-| Problem | Solution |
-|---------|----------|
-| CLP connector requires Presto rebuild when updated | Plugin can be updated independently |
-| CLP dependencies (clp-s) bloat Presto binary | Self-contained plugin with static clp-s linking |
-| Tight coupling between CLP and Presto codebase | Clean separation via plugin interface |
-| Difficult to distribute CLP connector separately | Single `.so` file deployment |
-
----
-
-## Prerequisites
-
-### Required: PR #26650 Merged
-
-[PR #26650](https://github.com/prestodb/presto/pull/26650) implements the plugin infrastructure from RFC-0019. This provides:
-
-- Plugin loading mechanism (`dlopen`/`dlsym`)
-- `registerExtensions()` entry point convention
-- `registerPrestoToVeloxConnector()` registration function
-- `plugin.dir` configuration property
-- Plugin directory scanning at startup
-
-### Design Decisions
-
-| Decision | Choice | Rationale |
-|----------|--------|-----------|
-| clp-s linking | **Static** | Self-contained plugin, simpler deployment |
-| Serialization | **JSON** | Works out-of-box; binary codecs optional future optimization |
-| Compatibility | **Plugin-only** | Cleaner architecture, easier maintenance |
+| Term | Definition |
+|------|------------|
+| **Velox CLP Connector** | C++ connector code that reads CLP archives/IR files. Located in `velox/connectors/clp/`. |
+| **CLP Plugin** | The `.so` shared library containing the Velox CLP Connector + bridge code. Distributed by YScope. |
+| **Plugin Loading Infrastructure** | Code in `presto_server` that scans a directory and loads `.so` files via `dlopen()`. |
+| **ClpPrestoToVeloxConnector** | Bridge class converting Presto protocol types to Velox connector types. |
+| **registerExtensions()** | Entry point function that plugins must export. Called by `presto_server` after `dlopen()`. |
 
 ---
 
@@ -169,107 +106,214 @@ The implementation follows [RFC-0019](https://github.com/prestodb/rfcs/blob/main
 
 ### Current Architecture (Static Linking)
 
-Currently, the Velox CLP Connector is statically linked into the `presto_server` binary:
+Currently, the Velox CLP Connector is statically linked into the `presto_server` binary. Users must build everything from source, including the private Velox fork.
 
 ```
-┌─────────────────────────────────────────────────────────────────────────┐
-│                         presto_server binary                            │
-│                                                                         │
-│  ┌─────────────────────────────────────────────────────────────────┐   │
-│  │                    Registration.cpp                              │   │
-│  │  registerConnectorFactories()                                    │   │
-│  │    └── ClpConnectorFactory (Velox connector factory)            │   │
-│  │  registerPrestoToVeloxConnector()                                │   │
-│  │    └── ClpPrestoToVeloxConnector (protocol bridge)              │   │
-│  └─────────────────────────────────────────────────────────────────┘   │
-│                              │                                          │
-│                              ▼                                          │
-│  ┌─────────────────────────────────────────────────────────────────┐   │
-│  │              velox_clp_connector (OBJECT library)                │   │
-│  │  ┌─────────────┐ ┌─────────────┐ ┌─────────────────────────┐    │   │
-│  │  │ClpConnector │ │ClpDataSource│ │     search_lib          │    │   │
-│  │  │ClpConfig    │ │ClpTableHandle│ │ArchiveCursor/IrCursor  │    │   │
-│  │  └─────────────┘ └─────────────┘ └─────────────────────────┘    │   │
-│  └─────────────────────────────────────────────────────────────────┘   │
-│                              │                                          │
-│                              ▼                                          │
-│  ┌─────────────────────────────────────────────────────────────────┐   │
-│  │                    clp-s libraries (STATIC)                      │   │
-│  │  clp_s::archive_reader, clp_s::search, clp_s::search::kql, etc. │   │
-│  └─────────────────────────────────────────────────────────────────┘   │
-└─────────────────────────────────────────────────────────────────────────┘
-```
-
-**Components in Current Architecture:**
-
-| Component | Location | Purpose |
-|-----------|----------|---------|
-| **Velox CLP Connector** | `velox/velox/connectors/clp/` | Core connector implementation (ClpConnector, ClpDataSource, etc.) |
-| **CLP Search Library** | `velox/velox/connectors/clp/search_lib/` | Archive/IR cursor implementations using clp-s |
-| **ClpPrestoToVeloxConnector** | `presto_cpp/main/connectors/PrestoToVeloxConnector.cpp` | Bridge: converts protocol types to Velox types |
-| **CLP Protocol Types** | `presto_cpp/presto_protocol/connector/clp/` | C++ types for JSON serialization (matching Java types) |
-| **Registration** | `presto_cpp/main/connectors/Registration.cpp` | Static registration at startup |
-
-### Plugin Architecture (Dynamic Loading)
-
-After converting to a plugin, the CLP connector loads dynamically at runtime:
-
-```
-┌────────────────────────────────────────────────────────────────────────────┐
-│                           presto_server binary                              │
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                         presto_server binary                                │
 │                                                                             │
-│  ┌──────────────────────────────────────────────────────────────────────┐  │
-│  │                       Plugin Loader                                   │  │
-│  │  1. Read plugin.dir from config.properties                           │  │
-│  │  2. Scan directory for .so files                                     │  │
-│  │  3. dlopen() each plugin                                             │  │
-│  │  4. dlsym("registerExtensions")                                      │  │
-│  │  5. Call registerExtensions()                                        │  │
-│  └──────────────────────────────────────────────────────────────────────┘  │
-│                              │                                              │
-│                              │ dlopen()                                     │
-└──────────────────────────────┼──────────────────────────────────────────────┘
-                               │
-      ┌────────────────────────┴────────────────────────────────┐
-      │                                                         │
-      │  ┌───────────────────────────────────────────────────┐  │
-      │  │              libclp_connector.so                   │  │
-      │  │                                                    │  │
-      │  │  extern "C" void registerExtensions() {           │  │
-      │  │    // Register Velox connector factory            │  │
-      │  │    registerConnectorFactory(ClpConnectorFactory)  │  │
-      │  │    // Register protocol bridge                    │  │
-      │  │    registerPrestoToVeloxConnector(                │  │
-      │  │        ClpPrestoToVeloxConnector)                 │  │
-      │  │  }                                                │  │
-      │  │                                                    │  │
-      │  │  ┌──────────────────────────────────────────────┐ │  │
-      │  │  │      ClpPrestoToVeloxConnector               │ │  │
-      │  │  │  - toVeloxSplit()                            │ │  │
-      │  │  │  - toVeloxColumnHandle()                     │ │  │
-      │  │  │  - toVeloxTableHandle()                      │ │  │
-      │  │  │  - createConnectorProtocol()                 │ │  │
-      │  │  └──────────────────────────────────────────────┘ │  │
-      │  │                                                    │  │
-      │  │  ┌──────────────────────────────────────────────┐ │  │
-      │  │  │      Velox CLP Connector (from velox/)       │ │  │
-      │  │  │  ClpConnector, ClpDataSource, ClpConfig      │ │  │
-      │  │  │  ClpTableHandle, ClpColumnHandle             │ │  │
-      │  │  │  search_lib (Archive/IR cursors)             │ │  │
-      │  │  └──────────────────────────────────────────────┘ │  │
-      │  │                                                    │  │
-      │  │  ┌──────────────────────────────────────────────┐ │  │
-      │  │  │      CLP Protocol Serialization              │ │  │
-      │  │  │  presto_protocol_clp.h/cpp                   │ │  │
-      │  │  │  ClpConnectorProtocol                        │ │  │
-      │  │  └──────────────────────────────────────────────┘ │  │
-      │  │                                                    │  │
-      │  │  ┌──────────────────────────────────────────────┐ │  │
-      │  │  │       clp-s (statically linked)              │ │  │
-      │  │  └──────────────────────────────────────────────┘ │  │
-      │  └───────────────────────────────────────────────────┘  │
-      │                    CLP Plugin                           │
-      └─────────────────────────────────────────────────────────┘
+│  ┌───────────────────────────────────────────────────────────────────────┐  │
+│  │                      Registration.cpp                                 │  │
+│  │  registerConnectorFactories()                                         │  │
+│  │    └── ClpConnectorFactory (Velox connector factory)                  │  │
+│  │  registerPrestoToVeloxConnector()                                     │  │
+│  │    └── ClpPrestoToVeloxConnector (protocol bridge)                    │  │
+│  └───────────────────────────────────────────────────────────────────────┘  │
+│                                │                                            │
+│                                ▼                                            │
+│  ┌───────────────────────────────────────────────────────────────────────┐  │
+│  │                velox_clp_connector (OBJECT library)                   │  │
+│  │  ┌─────────────┐ ┌──────────────┐ ┌───────────────────────────────┐   │  │
+│  │  │ClpConnector │ │ClpDataSource │ │        search_lib             │   │  │
+│  │  │ClpConfig    │ │ClpTableHandle│ │  ArchiveCursor / IrCursor     │   │  │
+│  │  └─────────────┘ └──────────────┘ └───────────────────────────────┘   │  │
+│  └───────────────────────────────────────────────────────────────────────┘  │
+│                                │                                            │
+│                                ▼                                            │
+│  ┌───────────────────────────────────────────────────────────────────────┐  │
+│  │                      clp-s libraries (STATIC)                         │  │
+│  │    clp_s::archive_reader, clp_s::search, clp_s::search::kql, etc.     │  │
+│  └───────────────────────────────────────────────────────────────────────┘  │
+│                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+#### Why This Is Problematic
+
+**1. OBJECT Library Cannot Be Pre-built**
+
+`velox_clp_connector` is defined as an **OBJECT library** in CMake:
+
+```cmake
+velox_add_library(
+  velox_clp_connector
+  OBJECT          # <-- This is the problem
+  ClpConfig.cpp
+  ClpConnector.cpp
+  ClpDataSource.cpp
+  ClpTableHandle.cpp)
+```
+
+An OBJECT library is **not a compiled artifact** (like `.a` or `.so`). It's just a list of source files that CMake compiles during the build. The compiled `.o` files are then linked directly into the final binary. This means:
+- You cannot distribute a pre-built OBJECT library
+- The source code **must be present** at build time
+- CMake must compile these files every time you build `presto_server`
+
+**2. Source Code Lives in Private Fork**
+
+The CLP connector source code is located in the private Velox fork (`y-scope/velox`), not in upstream Presto or upstream Velox:
+
+```
+y-scope/velox (private fork)
+└── velox/connectors/clp/           # CLP connector source
+    ├── ClpConnector.cpp
+    ├── ClpDataSource.cpp
+    └── search_lib/                 # Depends on clp-s
+        ├── archive/
+        └── ir/
+```
+
+**3. Dependency Chain Requires Full Build**
+
+The CLP connector depends on `clp-s` libraries, which also must be built from source:
+
+```
+presto_server
+└── velox_clp_connector (OBJECT - must compile from source)
+    └── clp-s-search (STATIC)
+        ├── clp-s-archive-search (STATIC)
+        │   └── clp_s::archive_reader, clp_s::search, etc.
+        └── clp-s-ir-search (STATIC)
+            └── clp_s::archive_reader, clp_s::search, etc.
+```
+
+**4. Why Not Just Distribute a Pre-built `presto_server` Binary?**
+
+You might ask: "Why not just build `presto_server` with CLP support and distribute that binary?"
+
+This doesn't work well because:
+
+| Reason | Explanation |
+|--------|-------------|
+| **Version coupling** | Users may need a specific Presto version for compatibility with their coordinator or other systems |
+| **Custom configurations** | Users may need different build flags, enabled features, or optimizations |
+| **Other connectors** | Users may need to build with other custom connectors or modifications |
+| **Platform differences** | Binary may not work across different Linux distributions or glibc versions |
+| **Security policies** | Many organizations require building from source for security audits |
+| **Updates** | Every Presto update would require rebuilding and redistributing the entire binary |
+
+**5. What Users Must Do Today**
+
+To use the CLP connector, users currently must:
+
+```bash
+# 1. Clone the private Velox fork (contains CLP connector + clp-s)
+git clone https://github.com/y-scope/velox.git
+
+# 2. Set up Velox build environment (install all dependencies)
+#    This includes: folly, fmt, boost, protobuf, etc.
+./scripts/setup-ubuntu.sh  # or equivalent for their OS
+
+# 3. Clone Presto and point to the private Velox fork
+git clone https://github.com/prestodb/presto.git
+cd presto/presto-native-execution
+
+# 4. Build everything from scratch (can take 30+ minutes)
+make -j$(nproc)
+```
+
+This is a significant barrier for users who just want to query CLP data.
+
+#### Alternative: Pre-built Static Library?
+
+You might ask: "Why not change `velox_clp_connector` from OBJECT to STATIC library, pre-build it, and distribute the `.a` file?"
+
+**This is technically possible**, but has significant practical challenges:
+
+**What would be required:**
+
+1. Change `velox_clp_connector` from OBJECT to STATIC library in CMakeLists.txt
+2. Build and distribute:
+   - `libvelox_clp_connector.a` (the static library)
+   - All header files (ClpConnector.h, ClpDataSource.h, etc.)
+   - All clp-s static libraries and headers
+3. Users would modify their Presto CMakeLists.txt to link against these pre-built libraries
+
+**Why this is problematic:**
+
+| Challenge | Explanation |
+|-----------|-------------|
+| **ABI Compatibility** | C++ static libraries require exact ABI match. Must be built with same compiler version, same C++ standard, same optimization flags, same Velox version, same Folly version, etc. Any mismatch causes crashes or undefined behavior. |
+| **Header Distribution** | Users need all header files to compile. CLP headers → Velox headers → Folly headers → Boost headers. This is a large dependency tree. |
+| **Version Coupling** | The static library must match the exact Velox version users are building. If Presto updates its Velox submodule, the pre-built library may become incompatible. |
+| **Build System Changes** | Users must modify `presto_cpp/main/CMakeLists.txt` to link the pre-built library. This is error-prone and creates maintenance burden. |
+| **Multiple Artifacts** | Must distribute: `.a` files + headers + CMake find modules. More complex than a single `.so` file. |
+
+**Comparison of approaches:**
+
+| Aspect | Static Library (.a) | Shared Plugin (.so) |
+|--------|---------------------|---------------------|
+| **User build changes** | Must modify CMakeLists.txt | None - just configure `plugin.dir` |
+| **ABI compatibility** | Must match Velox/Folly/compiler exactly | More tolerant - plugin boundary is well-defined |
+| **Distribution** | Multiple files (.a + headers) | Single `.so` file |
+| **Version coupling** | Tight - must match Velox version | Looser - plugin interface is stable |
+| **Runtime flexibility** | None - linked at build time | Can swap plugins without rebuild |
+| **Presto changes needed** | None | Must implement plugin loading (Part 1) |
+
+**Bottom line:** The static library approach avoids implementing plugin loading, but shifts complexity to users (ABI matching, build system changes, header management). The plugin approach requires upfront work (implementing `dlopen` infrastructure) but provides a cleaner user experience.
+
+### Proposed Architecture (Plugin Loading)
+
+After implementing plugin loading, the CLP connector becomes a separate `.so` file that users download and configure.
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│  Upstream Presto (prestodb/presto)                                          │
+│                                                                             │
+│  presto_server binary                                                       │
+│  ┌───────────────────────────────────────────────────────────────────────┐  │
+│  │  PrestoServer.cpp                                                     │  │
+│  │    └── loadPlugins()  ←── NEW: Scans plugin.dir, calls dlopen()       │  │
+│  ├───────────────────────────────────────────────────────────────────────┤  │
+│  │  SystemConfig.h                                                       │  │
+│  │    └── pluginDir()    ←── NEW: Returns plugin.dir config value        │  │
+│  ├───────────────────────────────────────────────────────────────────────┤  │
+│  │  Built-in connectors (Hive, TPCH, etc.) - statically linked           │  │
+│  └───────────────────────────────────────────────────────────────────────┘  │
+│                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘
+                                    │
+                                    │ dlopen() at runtime
+                                    ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│  YScope Private Distribution                                                │
+│                                                                             │
+│  libclp_connector.so                                                        │
+│  ┌───────────────────────────────────────────────────────────────────────┐  │
+│  │  extern "C" registerExtensions()  ←── Entry point                     │  │
+│  │    ├── registerConnectorFactory(ClpConnectorFactory)                  │  │
+│  │    └── registerPrestoToVeloxConnector(ClpPrestoToVeloxConnector)      │  │
+│  └───────────────────────────────────────────────────────────────────────┘  │
+│                                │                                            │
+│  ┌─────────────────────────────┴─────────────────────────────────────────┐  │
+│  │                    ClpPrestoToVeloxConnector                          │  │
+│  │  toVeloxSplit(), toVeloxColumnHandle(), toVeloxTableHandle()          │  │
+│  └───────────────────────────────────────────────────────────────────────┘  │
+│                                │                                            │
+│  ┌─────────────────────────────┴─────────────────────────────────────────┐  │
+│  │                    Velox CLP Connector                                │  │
+│  │  ClpConnector, ClpDataSource, ClpConfig, ClpTableHandle               │  │
+│  │  search_lib (ArchiveCursor, IrCursor)                                 │  │
+│  └───────────────────────────────────────────────────────────────────────┘  │
+│                                │                                            │
+│  ┌─────────────────────────────┴─────────────────────────────────────────┐  │
+│  │                    clp-s (statically linked into .so)                 │  │
+│  │  clp_s::archive_reader, clp_s::search, clp_s::search::kql, etc.       │  │
+│  └───────────────────────────────────────────────────────────────────────┘  │
+│                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+Benefit: Users build stock Presto, download .so from YScope, configure and run
 ```
 
 ### Data Flow
@@ -277,158 +321,343 @@ After converting to a plugin, the CLP connector loads dynamically at runtime:
 This diagram shows how data flows from the Presto Coordinator to the Velox CLP Connector:
 
 ```
-┌─────────────────────────────────────────────────────────────────┐
-│              Presto Coordinator (Java)                          │
-│                                                                 │
-│  User Query: SELECT * FROM clp.default.logs WHERE level='ERROR' │
-│                                                                 │
-│  Presto CLP Connector (Java) generates:                         │
-│  - ClpSplit objects (paths to CLP archives)                     │
-│  - ClpColumnHandle objects (columns to project)                 │
-│  - ClpTableLayoutHandle (table + KQL filter)                    │
-│                                                                 │
-│  Serializes to JSON and sends to workers                        │
-└───────────────────────────┬─────────────────────────────────────┘
-                            │ HTTP (JSON payload)
-                            ▼
-┌─────────────────────────────────────────────────────────────────┐
-│              Presto Worker (C++) - presto_server                │
-│                                                                 │
-│  1. Plugin Loader loads libclp_connector.so                     │
-│     - dlopen("libclp_connector.so")                             │
-│     - dlsym("registerExtensions")                               │
-│     - registerExtensions() called                               │
-│                                                                 │
-│  2. JSON deserialized via ClpConnectorProtocol                  │
-│     - JSON → protocol::clp::ClpSplit                            │
-│     - JSON → protocol::clp::ClpColumnHandle                     │
-│     - JSON → protocol::clp::ClpTableLayoutHandle                │
-└───────────────────────────┬─────────────────────────────────────┘
-                            │
-                            ▼
-┌─────────────────────────────────────────────────────────────────┐
-│              ClpPrestoToVeloxConnector (Bridge)                 │
-│                                                                 │
-│  Converts protocol types to Velox types:                        │
-│  - protocol::clp::ClpSplit → velox::connector::clp::ClpConnectorSplit
-│  - protocol::clp::ClpColumnHandle → velox::connector::clp::ClpColumnHandle
-│  - protocol::clp::ClpTableLayoutHandle → velox::connector::clp::ClpTableHandle
-└───────────────────────────┬─────────────────────────────────────┘
-                            │
-                            ▼
-┌─────────────────────────────────────────────────────────────────┐
-│              Velox CLP Connector                                │
-│                                                                 │
-│  ClpConnector::createDataSource()                               │
-│    └── Creates ClpDataSource with output schema                 │
-│                                                                 │
-│  ClpDataSource::addSplit()                                      │
-│    └── Creates cursor based on split type:                      │
-│        - SplitType::kArchive → ClpArchiveCursor                │
-│        - SplitType::kIr → ClpIrCursor                          │
-│                                                                 │
-│  ClpDataSource::next()                                          │
-│    └── cursor->fetchNext() → Row data                          │
-│    └── cursor->createVector() → RowVector                      │
-└───────────────────────────┬─────────────────────────────────────┘
-                            │
-                            ▼
-┌─────────────────────────────────────────────────────────────────┐
-│              clp-s Library                                      │
-│                                                                 │
-│  - Reads CLP archive/IR files from filesystem or S3             │
-│  - Decompresses log data                                        │
-│  - Executes KQL filters (e.g., "level:ERROR")                   │
-│  - Returns matching rows                                        │
-└───────────────────────────┬─────────────────────────────────────┘
-                            │
-                            ▼
-              RowVector → Velox Execution Engine → Results
-
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                        Presto Coordinator (Java)                            │
+│                                                                             │
+│  User Query: SELECT * FROM clp.default.logs WHERE level='ERROR'             │
+│                                                                             │
+│  Presto CLP Connector (Java) generates:                                     │
+│  - ClpSplit objects (paths to CLP archives/IR files)                        │
+│  - ClpColumnHandle objects (columns to project)                             │
+│  - ClpTableLayoutHandle (table metadata + KQL filter)                       │
+│                                                                             │
+│  Serializes to JSON and sends to workers via HTTP                           │
+└─────────────────────────────────────────────────────────────────────────────┘
+                                    │
+                                    │ HTTP (JSON payload)
+                                    ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                     Presto Worker (C++) - presto_server                     │
+│                                                                             │
+│  1. STARTUP: Plugin Loading                                                 │
+│     ┌─────────────────────────────────────────────────────────────────┐     │
+│     │  loadPlugins()                                                  │     │
+│     │    ├── Read plugin.dir from config.properties                   │     │
+│     │    ├── Scan directory for .so files                             │     │
+│     │    ├── dlopen("libclp_connector.so")                            │     │
+│     │    ├── dlsym("registerExtensions")                              │     │
+│     │    └── Call registerExtensions() which registers:               │     │
+│     │        ├── ClpConnectorFactory → Velox connector registry       │     │
+│     │        └── ClpPrestoToVeloxConnector → Presto bridge registry   │     │
+│     └─────────────────────────────────────────────────────────────────┘     │
+│                                                                             │
+│  2. QUERY: JSON Deserialization                                             │
+│     ┌─────────────────────────────────────────────────────────────────┐     │
+│     │  ClpConnectorProtocol deserializes JSON:                        │     │
+│     │    ├── JSON → protocol::clp::ClpSplit                           │     │
+│     │    ├── JSON → protocol::clp::ClpColumnHandle                    │     │
+│     │    └── JSON → protocol::clp::ClpTableLayoutHandle               │     │
+│     └─────────────────────────────────────────────────────────────────┘     │
+│                                    │                                        │
+│                                    ▼                                        │
+│  3. CONVERSION: Protocol to Velox Types                                     │
+│     ┌─────────────────────────────────────────────────────────────────┐     │
+│     │  ClpPrestoToVeloxConnector converts:                            │     │
+│     │    ├── protocol::clp::ClpSplit                                  │     │
+│     │    │   → velox::connector::clp::ClpConnectorSplit               │     │
+│     │    ├── protocol::clp::ClpColumnHandle                           │     │
+│     │    │   → velox::connector::clp::ClpColumnHandle                 │     │
+│     │    └── protocol::clp::ClpTableLayoutHandle                      │     │
+│     │        → velox::connector::clp::ClpTableHandle                  │     │
+│     └─────────────────────────────────────────────────────────────────┘     │
+│                                    │                                        │
+│                                    ▼                                        │
+│  4. EXECUTION: Velox CLP Connector                                          │
+│     ┌─────────────────────────────────────────────────────────────────┐     │
+│     │  ClpConnector::createDataSource(outputType, tableHandle)        │     │
+│     │    └── Creates ClpDataSource with output schema                 │     │
+│     │                                                                 │     │
+│     │  ClpDataSource::addSplit(split)                                 │     │
+│     │    └── Creates cursor based on split type:                      │     │
+│     │        ├── SplitType::kArchive → ClpArchiveCursor               │     │
+│     │        └── SplitType::kIr → ClpIrCursor                         │     │
+│     │                                                                 │     │
+│     │  ClpDataSource::next(size, output)                              │     │
+│     │    ├── cursor->fetchNext() → Fetch row data from clp-s          │     │
+│     │    └── cursor->createVector() → Create Velox RowVector          │     │
+│     └─────────────────────────────────────────────────────────────────┘     │
+│                                    │                                        │
+│                                    ▼                                        │
+│  5. DATA ACCESS: clp-s Library                                              │
+│     ┌─────────────────────────────────────────────────────────────────┐     │
+│     │  clp-s (statically linked into plugin)                          │     │
+│     │    ├── Reads CLP archive/IR files from filesystem or S3         │     │
+│     │    ├── Decompresses log data                                    │     │
+│     │    ├── Executes KQL filters (e.g., "level:ERROR")               │     │
+│     │    └── Returns matching rows to cursor                          │     │
+│     └─────────────────────────────────────────────────────────────────┘     │
+│                                    │                                        │
+│                                    ▼                                        │
+│                    RowVector → Velox Execution Engine → Results             │
+│                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘
 ```
 
----
+### Component Details
 
-## What PR #26650 Provides
+#### Velox CLP Connector Classes
 
-PR #26650 implements the plugin infrastructure defined in RFC-0019. After it's merged, the following capabilities are available:
+| Class | File | Purpose |
+|-------|------|---------|
+| `ClpConnector` | `ClpConnector.cpp` | Main connector class. Implements `velox::connector::Connector`. Creates `ClpDataSource` instances. |
+| `ClpConnectorFactory` | `ClpConnector.cpp` | Factory that creates `ClpConnector` instances. Registered with Velox connector registry. |
+| `ClpDataSource` | `ClpDataSource.cpp` | Reads data from CLP splits. Implements `velox::connector::DataSource`. Orchestrates cursor creation and row fetching. |
+| `ClpConnectorSplit` | `ClpConnectorSplit.h` | Describes a unit of work (archive file or IR stream). Contains path, split type, and optional KQL query. |
+| `ClpTableHandle` | `ClpTableHandle.h` | Represents the CLP table being queried. Contains connector ID and table name. |
+| `ClpColumnHandle` | `ClpColumnHandle.h` | Represents a column in the CLP table. Contains column name, original name, and Velox type. |
+| `ClpConfig` | `ClpConfig.cpp` | Configuration for the CLP connector (storage type, S3 settings, etc.). |
 
-### Plugin Loading Infrastructure
+#### Search Library Classes
 
-```cpp
-// In PrestoServer.cpp (provided by PR #26650)
-void loadPlugins() {
-  auto pluginDir = systemConfig_->pluginDir();
-  if (!pluginDir.empty()) {
-    for (const auto& entry : fs::directory_iterator(pluginDir)) {
-      if (entry.path().extension() == ".so" ||
-          entry.path().extension() == ".dylib") {
-        loadPlugin(entry.path().string());
-      }
-    }
-  }
-}
+| Class | File | Purpose |
+|-------|------|---------|
+| `BaseClpCursor` | `search_lib/BaseClpCursor.h` | Abstract base class for cursors. Defines `fetchNext()` and `createVector()` interface. |
+| `ClpArchiveCursor` | `search_lib/archive/ClpArchiveCursor.cpp` | Reads data from CLP archive format using `clp_s::ArchiveReader`. |
+| `ClpIrCursor` | `search_lib/ir/ClpIrCursor.cpp` | Reads data from CLP IR (Intermediate Representation) format. |
+| `ClpArchiveVectorLoader` | `search_lib/archive/ClpArchiveVectorLoader.cpp` | Creates Velox vectors from archive data. |
+| `ClpIrVectorLoader` | `search_lib/ir/ClpIrVectorLoader.cpp` | Creates Velox vectors from IR data. |
 
-void loadPlugin(const std::string& path) {
-  void* handle = dlopen(path.c_str(), RTLD_NOW | RTLD_GLOBAL);
-  auto registerFn = reinterpret_cast<void(*)()>(
-      dlsym(handle, "registerExtensions"));
-  registerFn();
-}
-```
+#### Protocol Bridge Classes
 
-### Registration Functions
-
-```cpp
-// Available for plugins to use (provided by PR #26650)
-void registerPrestoToVeloxConnector(
-    std::unique_ptr<const PrestoToVeloxConnector> connector);
-
-// From Velox (already available)
-void velox::connector::registerConnectorFactory(
-    std::shared_ptr<ConnectorFactory> factory);
-```
-
-### Configuration Property
-
-```properties
-# config.properties
-plugin.dir=/opt/presto/plugins
-```
+| Class | File | Purpose |
+|-------|------|---------|
+| `ClpPrestoToVeloxConnector` | `clp_plugin/ClpPrestoToVeloxConnector.cpp` | Converts Presto protocol types to Velox connector types. |
+| `ClpConnectorProtocol` | `presto_protocol/connector/clp/ClpConnectorProtocol.h` | JSON serialization/deserialization for CLP-specific types. |
+| `protocol::clp::ClpSplit` | `presto_protocol/connector/clp/presto_protocol_clp.h` | C++ protocol type matching Java `ClpSplit`. |
+| `protocol::clp::ClpColumnHandle` | `presto_protocol/connector/clp/presto_protocol_clp.h` | C++ protocol type matching Java `ClpColumnHandle`. |
+| `protocol::clp::ClpTableLayoutHandle` | `presto_protocol/connector/clp/presto_protocol_clp.h` | C++ protocol type matching Java `ClpTableLayoutHandle`. |
 
 ---
 
 ## Implementation Plan
 
-### Step 1: Create Plugin Directory Structure **[PRESTO]**
+### File Reference Summary
 
-> **Repository:** `prestodb/presto` - Submit for upstream review
+#### Part 1: Files to Modify in Upstream Presto
 
-Create the following directory structure:
+| File | Action | Description |
+|------|--------|-------------|
+| `presto_cpp/main/common/Configs.h` | Modify | Add `kPluginDir` constant and `pluginDir()` declaration |
+| `presto_cpp/main/common/Configs.cpp` | Modify | Add `pluginDir()` implementation |
+| `presto_cpp/main/PrestoServer.h` | Modify | Add `loadPlugins()` and `loadPlugin()` declarations |
+| `presto_cpp/main/PrestoServer.cpp` | Modify | Add plugin loading implementation, call `loadPlugins()` in `run()` |
+| `presto_cpp/main/CMakeLists.txt` | Modify | Add `${CMAKE_DL_LIBS}` for dlopen/dlsym |
+
+#### Part 2: Files for CLP Plugin (Private)
+
+| File | Action | Description |
+|------|--------|-------------|
+| `presto_cpp/main/connectors/clp_plugin/CMakeLists.txt` | Create | Plugin build configuration |
+| `presto_cpp/main/connectors/clp_plugin/ClpPluginEntry.cpp` | Create | `extern "C" registerExtensions()` entry point |
+| `presto_cpp/main/connectors/clp_plugin/ClpPrestoToVeloxConnector.h` | Create | Bridge class header |
+| `presto_cpp/main/connectors/clp_plugin/ClpPrestoToVeloxConnector.cpp` | Create | Bridge class implementation |
+| `presto_cpp/main/connectors/Registration.cpp` | Modify | Remove CLP registration |
+| `presto_cpp/main/connectors/PrestoToVeloxConnector.h` | Modify | Remove ClpPrestoToVeloxConnector class |
+| `presto_cpp/main/connectors/PrestoToVeloxConnector.cpp` | Modify | Remove ClpPrestoToVeloxConnector implementation |
+| `presto_cpp/main/CMakeLists.txt` | Modify | Remove `velox_clp_connector` link |
+| `presto_cpp/presto_protocol/presto_protocol.cpp` | Modify | Remove CLP protocol include |
+| `presto_cpp/main/connectors/CMakeLists.txt` | Modify | Add `add_subdirectory(clp_plugin)` |
+
+#### Files Referenced (No Changes)
+
+| File | Purpose |
+|------|---------|
+| `velox/velox/connectors/clp/*` | Velox CLP connector implementation (compiled into plugin) |
+| `velox/velox/connectors/clp/search_lib/*` | Archive/IR cursor implementations (compiled into plugin) |
+| `presto_cpp/presto_protocol/connector/clp/*` | Protocol serialization types (compiled into plugin) |
+
+---
+
+### Part 1: Plugin Loading Infrastructure (Upstream to Presto)
+
+> **Repository:** `prestodb/presto`
+> **Purpose:** Enable `presto_server` to load connector plugins from a configured directory
+> **Status:** ⚠️ **THIS CODE DOES NOT EXIST YET** - Must be implemented and submitted as a PR to upstream Presto
+
+This is generic infrastructure that benefits all connector plugin authors, not just CLP. The implementation uses POSIX `dlopen()`/`dlsym()` to dynamically load shared libraries at runtime.
+
+**Why this needs to be upstreamed:**
+- RFC-0019 proposed this mechanism but it was never implemented
+- PR #26650 and PR #26257 add serialization features, NOT plugin loading
+- Without this infrastructure in upstream Presto, users cannot load external connector plugins
+
+#### 1.1 Add `pluginDir` Configuration Property
+
+**File:** `presto_cpp/main/common/Configs.h`
+
+```cpp
+// Add to SystemConfig class
+/// Path to directory containing connector plugin .so files
+static constexpr std::string_view kPluginDir{"plugin.dir"};
+```
+
+**File:** `presto_cpp/main/common/Configs.cpp`
+
+```cpp
+// Add to SystemConfig
+std::string SystemConfig::pluginDir() const {
+  return optionalProperty(std::string(kPluginDir)).value_or("");
+}
+```
+
+**File:** `presto_cpp/main/common/Configs.h` (declaration)
+
+```cpp
+// Add to SystemConfig class public section
+std::string pluginDir() const;
+```
+
+#### 1.2 Add Plugin Loading Functions
+
+**File:** `presto_cpp/main/PrestoServer.h`
+
+```cpp
+// Add to PrestoServer class private section
+void loadPlugins();
+void loadPlugin(const std::string& path);
+```
+
+**File:** `presto_cpp/main/PrestoServer.cpp`
+
+Add includes at top:
+```cpp
+#include <dlfcn.h>
+#include <filesystem>
+```
+
+Add implementation:
+```cpp
+void PrestoServer::loadPlugin(const std::string& path) {
+  LOG(INFO) << "Loading plugin from " << path;
+
+  void* handle = dlopen(path.c_str(), RTLD_NOW | RTLD_GLOBAL);
+  if (!handle) {
+    LOG(ERROR) << "Failed to load plugin " << path << ": " << dlerror();
+    return;
+  }
+
+  dlerror(); // Clear any existing error
+  auto registerFn = reinterpret_cast<void(*)()>(
+      dlsym(handle, "registerExtensions"));
+  const char* error = dlerror();
+
+  if (error != nullptr) {
+    LOG(ERROR) << "Plugin " << path << " missing registerExtensions: " << error;
+    dlclose(handle);
+    return;
+  }
+
+  if (registerFn == nullptr) {
+    LOG(ERROR) << "Plugin " << path << " has null registerExtensions symbol";
+    dlclose(handle);
+    return;
+  }
+
+  registerFn();
+  LOG(INFO) << "Successfully loaded plugin from " << path;
+}
+
+void PrestoServer::loadPlugins() {
+  const auto pluginDir = systemConfig_->pluginDir();
+  if (pluginDir.empty()) {
+    LOG(INFO) << "No plugin directory configured (plugin.dir not set)";
+    return;
+  }
+
+  if (!std::filesystem::exists(pluginDir)) {
+    LOG(WARNING) << "Plugin directory does not exist: " << pluginDir;
+    return;
+  }
+
+  LOG(INFO) << "Loading plugins from " << pluginDir;
+
+  for (const auto& entry : std::filesystem::directory_iterator(pluginDir)) {
+    const auto& path = entry.path();
+    if (path.extension() == ".so" || path.extension() == ".dylib") {
+      loadPlugin(path.string());
+    }
+  }
+}
+```
+
+#### 1.3 Call loadPlugins() During Startup
+
+**File:** `presto_cpp/main/PrestoServer.cpp`
+
+In the `run()` method, add `loadPlugins()` call after connector registration:
+
+```cpp
+void PrestoServer::run() {
+  // ... existing initialization code ...
+
+  registerConnectors();
+  loadPlugins();  // ADD THIS LINE - Load plugins after built-in connectors
+
+  // ... rest of existing code ...
+}
+```
+
+#### 1.4 Update CMakeLists.txt
+
+**File:** `presto_cpp/main/CMakeLists.txt`
+
+Add `${CMAKE_DL_LIBS}` to link the `dl` library for `dlopen`/`dlsym`:
+
+```cmake
+target_link_libraries(
+  presto_server_lib
+  # ... existing libraries ...
+  ${CMAKE_DL_LIBS}  # ADD THIS LINE
+)
+```
+
+#### 1.5 Summary of Part 1 Changes
+
+| File | Change |
+|------|--------|
+| `presto_cpp/main/common/Configs.h` | Add `kPluginDir` constant and `pluginDir()` declaration |
+| `presto_cpp/main/common/Configs.cpp` | Add `pluginDir()` implementation |
+| `presto_cpp/main/PrestoServer.h` | Add `loadPlugins()` and `loadPlugin()` declarations |
+| `presto_cpp/main/PrestoServer.cpp` | Add plugin loading implementation, call in `run()` |
+| `presto_cpp/main/CMakeLists.txt` | Add `${CMAKE_DL_LIBS}` |
+
+---
+
+### Part 2: CLP Connector Plugin (Private Distribution)
+
+> **Repository:** Private (YScope)
+> **Purpose:** Build the CLP connector as a self-contained `.so` file
+> **Prerequisite:** ⚠️ Part 1 must be implemented and merged into upstream Presto first
+
+This part stays entirely in your private repository and is never merged upstream. The plugin contains:
+
+1. **Entry Point** (`ClpPluginEntry.cpp`) - `extern "C" registerExtensions()` function called by `presto_server`
+2. **Protocol Bridge** (`ClpPrestoToVeloxConnector`) - Converts Presto protocol types to Velox connector types
+3. **Velox CLP Connector** - Compiled from `velox/connectors/clp/` (OBJECT library)
+4. **CLP Search Library** - Compiled from `velox/connectors/clp/search_lib/`
+5. **clp-s** - Statically linked into the plugin
+
+#### 2.1 Create Plugin Directory Structure
 
 ```
-presto-native-execution/
-└── presto_cpp/
-    └── main/
-        └── connectors/
-            └── clp_plugin/
-                ├── CMakeLists.txt
-                ├── ClpPluginEntry.cpp
-                ├── ClpPrestoToVeloxConnector.h
-                └── ClpPrestoToVeloxConnector.cpp
+presto_cpp/main/connectors/clp_plugin/
+├── CMakeLists.txt                    # Build configuration for shared library
+├── ClpPluginEntry.cpp                # extern "C" registerExtensions() entry point
+├── ClpPrestoToVeloxConnector.h       # Bridge class header
+└── ClpPrestoToVeloxConnector.cpp     # Bridge class implementation
 ```
 
-**Note**: The plugin will reference the existing Velox CLP connector sources and protocol sources from their current locations. We don't need to copy them.
-
-### Step 2: Extract ClpPrestoToVeloxConnector **[PRESTO]**
-
-> **Repository:** `prestodb/presto` - Submit for upstream review
->
-> **Note:** This code lives in `presto_cpp/` and references Velox CLP connector headers via includes.
-
-Extract the `ClpPrestoToVeloxConnector` class from `PrestoToVeloxConnector.cpp` into standalone files.
-
-#### ClpPrestoToVeloxConnector.h
+#### 2.2 ClpPrestoToVeloxConnector.h
 
 ```cpp
 // presto_cpp/main/connectors/clp_plugin/ClpPrestoToVeloxConnector.h
@@ -439,26 +668,20 @@ Extract the `ClpPrestoToVeloxConnector` class from `PrestoToVeloxConnector.cpp` 
 
 namespace facebook::presto {
 
-/// Bridge class that converts Presto CLP protocol types to Velox CLP connector types.
-/// This enables communication between the Java-side Presto CLP Connector and
-/// the C++-side Velox CLP Connector.
 class ClpPrestoToVeloxConnector final : public PrestoToVeloxConnector {
  public:
   explicit ClpPrestoToVeloxConnector(std::string connectorName)
       : PrestoToVeloxConnector(std::move(connectorName)) {}
 
-  /// Converts protocol::clp::ClpSplit to velox::connector::clp::ClpConnectorSplit
   std::unique_ptr<velox::connector::ConnectorSplit> toVeloxSplit(
       const protocol::ConnectorId& catalogId,
       const protocol::ConnectorSplit* connectorSplit,
       const protocol::SplitContext* splitContext) const override;
 
-  /// Converts protocol::clp::ClpColumnHandle to velox::connector::clp::ClpColumnHandle
   std::unique_ptr<velox::connector::ColumnHandle> toVeloxColumnHandle(
       const protocol::ColumnHandle* column,
       const TypeParser& typeParser) const override;
 
-  /// Converts protocol::clp::ClpTableLayoutHandle to velox::connector::clp::ClpTableHandle
   std::unique_ptr<velox::connector::ConnectorTableHandle> toVeloxTableHandle(
       const protocol::TableHandle& tableHandle,
       const VeloxExprConverter& exprConverter,
@@ -468,7 +691,6 @@ class ClpPrestoToVeloxConnector final : public PrestoToVeloxConnector {
           std::shared_ptr<velox::connector::ColumnHandle>>& assignments)
       const override;
 
-  /// Creates the ClpConnectorProtocol for JSON serialization/deserialization
   std::unique_ptr<protocol::ConnectorProtocol> createConnectorProtocol()
       const override;
 };
@@ -476,7 +698,7 @@ class ClpPrestoToVeloxConnector final : public PrestoToVeloxConnector {
 } // namespace facebook::presto
 ```
 
-#### ClpPrestoToVeloxConnector.cpp
+#### 2.3 ClpPrestoToVeloxConnector.cpp
 
 ```cpp
 // presto_cpp/main/connectors/clp_plugin/ClpPrestoToVeloxConnector.cpp
@@ -565,11 +787,7 @@ ClpPrestoToVeloxConnector::createConnectorProtocol() const {
 } // namespace facebook::presto
 ```
 
-### Step 3: Create Plugin Entry Point **[PRESTO]**
-
-> **Repository:** `prestodb/presto` - Submit for upstream review
-
-#### ClpPluginEntry.cpp
+#### 2.4 ClpPluginEntry.cpp
 
 ```cpp
 // presto_cpp/main/connectors/clp_plugin/ClpPluginEntry.cpp
@@ -580,10 +798,7 @@ ClpPrestoToVeloxConnector::createConnectorProtocol() const {
 
 extern "C" {
 
-/// Plugin entry point called by Presto worker after dlopen().
-/// This function registers:
-/// 1. The Velox CLP Connector factory (ClpConnectorFactory)
-/// 2. The protocol bridge (ClpPrestoToVeloxConnector)
+/// Plugin entry point called by presto_server after dlopen().
 void registerExtensions() {
   using namespace facebook::presto;
   using namespace facebook::velox::connector;
@@ -591,7 +806,7 @@ void registerExtensions() {
   const std::string connectorName =
       clp::ClpConnectorFactory::kClpConnectorName;
 
-  // Register Velox connector factory (if not already registered)
+  // Register Velox connector factory
   if (!hasConnectorFactory(connectorName)) {
     registerConnectorFactory(std::make_shared<clp::ClpConnectorFactory>());
   }
@@ -604,15 +819,18 @@ void registerExtensions() {
 } // extern "C"
 ```
 
-### Step 4: Create Plugin CMakeLists.txt **[PRESTO]**
+#### 2.5 CMakeLists.txt
 
-> **Repository:** `prestodb/presto` - Submit for upstream review
->
-> **Note:** This CMake file references **[VELOX]** targets (`velox_clp_connector`, `clp-s-*`) that must exist in your Velox submodule.
+The CMakeLists.txt is the most complex part. Here's a detailed breakdown:
 
-**IMPORTANT**: `velox_clp_connector` is an OBJECT library, not a regular library. This means we need to use `$<TARGET_OBJECTS:>` to link its object files into our shared library.
+**Key Concepts:**
 
-Similarly, `presto_protocol` is an OBJECT library, and the CLP protocol sources are included via `#include` in `presto_protocol.cpp`. Since we're creating a standalone plugin, we need to include the protocol source directly.
+| Concept | Explanation |
+|---------|-------------|
+| **SHARED library** | Creates a `.so` (Linux) or `.dylib` (macOS) that can be loaded at runtime via `dlopen()` |
+| **OBJECT library** | `velox_clp_connector` is an OBJECT library, meaning it compiles to `.o` files but not an archive. Must use `$<TARGET_OBJECTS:>` generator expression to link. |
+| **Static linking clp-s** | clp-s libraries are linked statically into the plugin so users don't need to install clp-s separately |
+| **Undefined symbols** | The plugin references symbols from `presto_server` (like `registerPrestoToVeloxConnector`). These are resolved at runtime when the plugin is loaded. |
 
 ```cmake
 # presto_cpp/main/connectors/clp_plugin/CMakeLists.txt
@@ -623,90 +841,103 @@ cmake_minimum_required(VERSION 3.20)
 # CLP Connector Plugin - Shared Library
 # =============================================================================
 
+# Create a SHARED library (produces libclp_connector.so)
 add_library(clp_connector_plugin SHARED
     ClpPluginEntry.cpp
     ClpPrestoToVeloxConnector.cpp
-)
-
-# Include CLP protocol source directly
-# (presto_protocol is an OBJECT library and includes connector protocols via #include)
-target_sources(clp_connector_plugin
-    PRIVATE
-        ${CMAKE_SOURCE_DIR}/presto_cpp/presto_protocol/connector/clp/presto_protocol_clp.cpp
+    # Include CLP protocol source directly because presto_protocol is an OBJECT
+    # library that includes connector protocols via #include, not linking.
+    # We need to compile the protocol source into our plugin.
+    ${CMAKE_SOURCE_DIR}/presto_cpp/presto_protocol/connector/clp/presto_protocol_clp.cpp
 )
 
 # -----------------------------------------------------------------------------
 # Include Directories
 # -----------------------------------------------------------------------------
+# These allow the plugin source files to find headers
 target_include_directories(clp_connector_plugin
     PRIVATE
-        ${CMAKE_SOURCE_DIR}
-        ${CMAKE_SOURCE_DIR}/velox
-        ${CMAKE_SOURCE_DIR}/presto_cpp
+        ${CMAKE_SOURCE_DIR}          # For presto_cpp/ includes
+        ${CMAKE_SOURCE_DIR}/velox    # For velox/ includes
 )
 
 # -----------------------------------------------------------------------------
 # Link Dependencies
 # -----------------------------------------------------------------------------
 
-# IMPORTANT: velox_clp_connector is an OBJECT library
-# We must use $<TARGET_OBJECTS:> to include its compiled object files
+# IMPORTANT: velox_clp_connector is an OBJECT library (not STATIC or SHARED).
+# OBJECT libraries compile sources to .o files but don't create an archive.
+# To link an OBJECT library, you must use the $<TARGET_OBJECTS:> generator
+# expression, which expands to the list of .o files.
 target_link_libraries(clp_connector_plugin
     PRIVATE
-        # Velox CLP connector objects (OBJECT library)
+        # Velox CLP connector objects - MUST use $<TARGET_OBJECTS:> because
+        # velox_clp_connector is an OBJECT library
         $<TARGET_OBJECTS:velox_clp_connector>
 
-        # CLP search libraries (STATIC - bundled into plugin)
-        clp-s-search
-        clp-s-archive-search
-        clp-s-ir-search
+        # CLP search libraries (these are STATIC libraries)
+        # Located in velox/connectors/clp/search_lib/
+        clp-s-search           # Base cursor classes
+        clp-s-archive-search   # Archive format support
+        clp-s-ir-search        # IR format support
 
-        # clp-s dependencies
-        clp_s::archive_reader
-        clp_s::clp_dependencies
-        clp_s::io
-        clp_s::search
-        clp_s::search::ast
-        clp_s::search::kql
+        # clp-s core dependencies (statically linked into plugin)
+        # These are the YScope CLP libraries for reading compressed logs
+        clp_s::archive_reader  # Reads CLP archive format
+        clp_s::clp_dependencies # Common CLP dependencies
+        clp_s::io              # I/O utilities
+        clp_s::search          # Search functionality
+        clp_s::search::ast     # AST for search queries
+        clp_s::search::kql     # KQL (Kibana Query Language) parser
 
-        # Velox dependencies
-        velox_connector
-        velox_vector
-        velox_type
+        # Velox dependencies needed by the connector
+        velox_connector        # Base connector interfaces
+        velox_vector           # Vector/column types
+        velox_type             # Type system
 
         # Common dependencies
-        simdjson::simdjson
-        Folly::folly
-        fmt::fmt
-        glog::glog
+        simdjson::simdjson     # JSON parsing (used by protocol)
+        Folly::folly           # Facebook's core library
+        fmt::fmt               # String formatting
+        glog::glog             # Logging
 )
 
 # -----------------------------------------------------------------------------
 # Linker Options
 # -----------------------------------------------------------------------------
 
-# Allow undefined symbols - they will be resolved at runtime by presto_server
-# This is necessary because we depend on presto_server symbols like
-# registerPrestoToVeloxConnector() which are not linked into the plugin
+# The plugin references symbols that exist in presto_server but are not linked
+# into the plugin itself. For example:
+#   - registerPrestoToVeloxConnector() from PrestoToVeloxConnector.cpp
+#   - registerConnectorFactory() from Velox
+#
+# These symbols will be resolved at runtime when presto_server loads the plugin
+# via dlopen() with RTLD_GLOBAL flag.
+#
+# Without these linker options, the build would fail with "undefined symbol" errors.
 if(APPLE)
+    # macOS: Allow undefined symbols, resolve at runtime
     target_link_options(clp_connector_plugin
         PRIVATE "-Wl,-undefined,dynamic_lookup")
 else()
+    # Linux: Allow shared library to have undefined symbols
     target_link_options(clp_connector_plugin
         PRIVATE "-Wl,--allow-shlib-undefined")
 endif()
 
 # -----------------------------------------------------------------------------
-# Compile Features and Properties
+# Properties
 # -----------------------------------------------------------------------------
 
-# C++20 required for clp-s
+# C++20 required for clp-s library
 target_compile_features(clp_connector_plugin PRIVATE cxx_std_20)
 
-# Position independent code (required for shared libraries)
 set_target_properties(clp_connector_plugin PROPERTIES
+    # Required for shared libraries - all code must be position independent
     POSITION_INDEPENDENT_CODE ON
+    # Output name: libclp_connector.so (without "_plugin" suffix)
     OUTPUT_NAME "clp_connector"
+    # Ensure "lib" prefix on all platforms
     PREFIX "lib"
 )
 
@@ -714,74 +945,129 @@ set_target_properties(clp_connector_plugin PROPERTIES
 # Installation
 # -----------------------------------------------------------------------------
 
+# Install to standard plugin location
 install(TARGETS clp_connector_plugin
-    LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}/presto/plugins
+    LIBRARY DESTINATION lib/presto/plugins
 )
 ```
 
-### Step 5: Remove CLP from Static Build **[PRESTO]**
+**Dependency Graph:**
 
-> **Repository:** `prestodb/presto` - All sub-steps in this section are Presto changes for upstream review.
+```
+libclp_connector.so
+├── ClpPluginEntry.cpp (registerExtensions)
+├── ClpPrestoToVeloxConnector.cpp (protocol bridge)
+├── presto_protocol_clp.cpp (JSON serialization)
+├── $<TARGET_OBJECTS:velox_clp_connector>
+│   ├── ClpConnector.cpp
+│   ├── ClpDataSource.cpp
+│   ├── ClpConfig.cpp
+│   └── ClpTableHandle.cpp
+├── clp-s-search (STATIC)
+│   ├── clp-s-archive-search (STATIC)
+│   │   └── clp_s::archive_reader, clp_s::search, etc.
+│   └── clp-s-ir-search (STATIC)
+│       └── clp_s::archive_reader, clp_s::search, etc.
+├── velox_connector (resolved at runtime)
+├── velox_vector (resolved at runtime)
+└── Folly, fmt, glog, simdjson
+```
 
-#### 5.1 Modify Registration.cpp **[PRESTO]**
+#### 2.6 Remove CLP from Static Build
 
-Remove CLP-related includes and registration:
+Remove CLP connector from the static `presto_server` build so it's only loaded as a plugin. This ensures:
+- No duplicate registration when plugin loads
+- Smaller `presto_server` binary
+- Clean separation between built-in and plugin connectors
 
+##### 2.6.1 Modify `presto_cpp/main/connectors/Registration.cpp`
+
+**Remove the CLP include at the top of the file:**
 ```cpp
-// presto_cpp/main/connectors/Registration.cpp
+// REMOVE this line:
+#include "velox/connectors/clp/ClpConnector.h"
+```
 
-// REMOVE this include:
-// #include "velox/connectors/clp/ClpConnector.h"
-
+**Remove CLP factory registration from `registerConnectorFactories()`:**
+```cpp
 void registerConnectorFactories() {
-  // ... keep other connectors ...
+  // ... keep other connectors (Hive, TPCH, etc.) ...
 
-  // REMOVE these lines (CLP now loaded as plugin):
-  // if (!velox::connector::hasConnectorFactory(
-  //         velox::connector::clp::ClpConnectorFactory::kClpConnectorName)) {
-  //   velox::connector::registerConnectorFactory(
-  //       std::make_shared<velox::connector::clp::ClpConnectorFactory>());
-  // }
+  // REMOVE this entire block:
+  if (!velox::connector::hasConnectorFactory(
+          velox::connector::clp::ClpConnectorFactory::kClpConnectorName)) {
+    velox::connector::registerConnectorFactory(
+        std::make_shared<velox::connector::clp::ClpConnectorFactory>());
+  }
 }
+```
 
+**Remove CLP bridge registration from `registerConnectors()`:**
+```cpp
 void registerConnectors() {
   registerConnectorFactories();
   // ... keep other connectors ...
 
-  // REMOVE these lines (CLP now loaded as plugin):
-  // registerPrestoToVeloxConnector(
-  //     std::make_unique<ClpPrestoToVeloxConnector>(
-  //         velox::connector::clp::ClpConnectorFactory::kClpConnectorName));
+  // REMOVE this entire block:
+  registerPrestoToVeloxConnector(
+      std::make_unique<ClpPrestoToVeloxConnector>(
+          velox::connector::clp::ClpConnectorFactory::kClpConnectorName));
 }
 ```
 
-#### 5.2 Modify PrestoToVeloxConnector.h **[PRESTO]**
+##### 2.6.2 Modify `presto_cpp/main/connectors/PrestoToVeloxConnector.h`
 
-Remove the `ClpPrestoToVeloxConnector` class declaration (lines 227-252 in current file).
+**Remove the `ClpPrestoToVeloxConnector` class declaration (approximately lines 227-252):**
+```cpp
+// REMOVE this entire class:
+class ClpPrestoToVeloxConnector final : public PrestoToVeloxConnector {
+ public:
+  explicit ClpPrestoToVeloxConnector(std::string connectorName)
+      : PrestoToVeloxConnector(std::move(connectorName)) {}
 
-#### 5.3 Modify PrestoToVeloxConnector.cpp **[PRESTO]**
+  std::unique_ptr<velox::connector::ConnectorSplit> toVeloxSplit(
+      const protocol::ConnectorId& catalogId,
+      const protocol::ConnectorSplit* connectorSplit,
+      const protocol::SplitContext* splitContext) const override;
 
-Remove the `ClpPrestoToVeloxConnector` implementation.
-
-#### 5.4 Modify presto_cpp/main/connectors/CMakeLists.txt **[PRESTO]**
-
-```cmake
-# BEFORE:
-target_link_libraries(presto_connectors presto_velox_expr_conversion
-                      velox_clp_connector velox_type_fbhive)
-
-# AFTER (remove velox_clp_connector):
-target_link_libraries(presto_connectors presto_velox_expr_conversion
-                      velox_type_fbhive)
-
-# Add plugin subdirectory at the end:
-add_subdirectory(clp_plugin)
+  // ... rest of the class ...
+};
 ```
 
-#### 5.5 Modify presto_cpp/main/CMakeLists.txt **[PRESTO]**
+Also remove the CLP-related includes:
+```cpp
+// REMOVE these includes:
+#include "velox/connectors/clp/ClpColumnHandle.h"
+#include "velox/connectors/clp/ClpConnectorSplit.h"
+#include "velox/connectors/clp/ClpTableHandle.h"
+```
 
+##### 2.6.3 Modify `presto_cpp/main/connectors/PrestoToVeloxConnector.cpp`
+
+**Remove the entire `ClpPrestoToVeloxConnector` implementation:**
+```cpp
+// REMOVE all ClpPrestoToVeloxConnector method implementations:
+// - toVeloxSplit()
+// - toVeloxColumnHandle()
+// - toVeloxTableHandle()
+// - createConnectorProtocol()
+```
+
+Also remove the CLP-related includes:
+```cpp
+// REMOVE these includes:
+#include "presto_cpp/presto_protocol/connector/clp/ClpConnectorProtocol.h"
+#include "presto_cpp/presto_protocol/connector/clp/presto_protocol_clp.h"
+#include "velox/connectors/clp/ClpColumnHandle.h"
+#include "velox/connectors/clp/ClpConnector.h"
+#include "velox/connectors/clp/ClpConnectorSplit.h"
+#include "velox/connectors/clp/ClpTableHandle.h"
+```
+
+##### 2.6.4 Modify `presto_cpp/main/CMakeLists.txt`
+
+**Remove `velox_clp_connector` from `presto_server_lib` link libraries:**
 ```cmake
-# Remove velox_clp_connector from presto_server_lib dependencies:
 target_link_libraries(
   presto_server_lib
   # ... other libraries ...
@@ -790,144 +1076,97 @@ target_link_libraries(
 )
 ```
 
-#### 5.6 Modify presto_cpp/presto_protocol/presto_protocol.cpp **[PRESTO]**
+##### 2.6.5 Modify `presto_cpp/presto_protocol/presto_protocol.cpp`
 
+**Remove the CLP protocol include:**
 ```cpp
-// REMOVE this include (CLP protocol now built into plugin):
-// #include "presto_cpp/presto_protocol/connector/clp/presto_protocol_clp.cpp"
+// REMOVE this line (around line 19):
+#include "presto_cpp/presto_protocol/connector/clp/presto_protocol_clp.cpp"
 ```
 
----
+##### 2.6.6 Modify `presto_cpp/main/connectors/CMakeLists.txt`
 
-## File Reference
+**Add the plugin subdirectory at the end of the file:**
+```cmake
+# Existing content...
 
-### Files to Create **[PRESTO]**
+# ADD this line at the end:
+add_subdirectory(clp_plugin)
+```
 
-> **All files below go to `prestodb/presto` for upstream review.**
+##### 2.6.7 Summary of Removals
 
-| File | Purpose | Repository |
-|------|---------|------------|
-| `presto_cpp/main/connectors/clp_plugin/CMakeLists.txt` | Plugin build configuration | **[PRESTO]** |
-| `presto_cpp/main/connectors/clp_plugin/ClpPluginEntry.cpp` | `extern "C" registerExtensions()` entry point | **[PRESTO]** |
-| `presto_cpp/main/connectors/clp_plugin/ClpPrestoToVeloxConnector.h` | Bridge class header | **[PRESTO]** |
-| `presto_cpp/main/connectors/clp_plugin/ClpPrestoToVeloxConnector.cpp` | Bridge class implementation | **[PRESTO]** |
-
-### Files to Modify **[PRESTO]**
-
-> **All files below go to `prestodb/presto` for upstream review.**
-
-| File | Change | Repository |
-|------|--------|------------|
-| `presto_cpp/main/connectors/Registration.cpp` | Remove CLP registration and includes | **[PRESTO]** |
-| `presto_cpp/main/connectors/PrestoToVeloxConnector.h` | Remove ClpPrestoToVeloxConnector class | **[PRESTO]** |
-| `presto_cpp/main/connectors/PrestoToVeloxConnector.cpp` | Remove ClpPrestoToVeloxConnector implementation | **[PRESTO]** |
-| `presto_cpp/main/connectors/CMakeLists.txt` | Remove CLP links, add plugin subdirectory | **[PRESTO]** |
-| `presto_cpp/main/CMakeLists.txt` | Remove velox_clp_connector link | **[PRESTO]** |
-| `presto_cpp/presto_protocol/presto_protocol.cpp` | Remove CLP protocol include | **[PRESTO]** |
-
-### Files Referenced by Plugin (No Changes Needed)
-
-> **These files are referenced/included by the plugin but do not need modification.**
-
-| File | Purpose | Repository |
-|------|---------|------------|
-| `velox/velox/connectors/clp/*` | Velox CLP connector implementation | **[VELOX]** - Private repo |
-| `velox/velox/connectors/clp/search_lib/*` | Archive/IR cursor implementations | **[VELOX]** - Private repo |
-| `presto_cpp/presto_protocol/connector/clp/*` | Protocol serialization types | **[PRESTO]** - Existing code |
-| `presto_cpp/main/connectors/PrestoToVeloxConnector.h` | Base class (symbols resolved at runtime) | **[PRESTO]** - Existing code |
+| File | What to Remove |
+|------|----------------|
+| `Registration.cpp` | CLP include, factory registration, bridge registration |
+| `PrestoToVeloxConnector.h` | `ClpPrestoToVeloxConnector` class, CLP includes |
+| `PrestoToVeloxConnector.cpp` | `ClpPrestoToVeloxConnector` implementation, CLP includes |
+| `presto_cpp/main/CMakeLists.txt` | `velox_clp_connector` from link libraries |
+| `presto_protocol.cpp` | CLP protocol include |
 
 ---
 
 ## Build Instructions
 
-### Build Plugin Only
+### Building the Plugin
 
 ```bash
 cd presto-native-execution
-mkdir -p _build/release
-cd _build/release
+mkdir -p _build/release && cd _build/release
 
 cmake ../.. \
     -DCMAKE_BUILD_TYPE=Release \
-    -DPRESTO_ENABLE_PARQUET=ON \
-    -DVELOX_ENABLE_HDFS=ON
+    -DPRESTO_ENABLE_PARQUET=ON
 
-# Build only the CLP plugin
+# Build the plugin
 make -j$(nproc) clp_connector_plugin
+
+# Output: _build/release/presto_cpp/main/connectors/clp_plugin/libclp_connector.so
 ```
 
-### Build Full Presto + Plugin
+### Verify Plugin
 
 ```bash
-cd presto-native-execution
-mkdir -p _build/release
-cd _build/release
+# Check entry point symbol exists
+nm -D libclp_connector.so | grep registerExtensions
+# Expected: T registerExtensions
 
-cmake ../.. \
-    -DCMAKE_BUILD_TYPE=Release \
-    -DPRESTO_ENABLE_PARQUET=ON \
-    -DVELOX_ENABLE_HDFS=ON
-
-make -j$(nproc) presto_server
-make -j$(nproc) clp_connector_plugin
-```
-
-### Verify Build Output
-
-```bash
-# Check plugin exists
-ls -la _build/release/presto_cpp/main/connectors/clp_plugin/libclp_connector.so
-
-# Verify entry point symbol (must show "T registerExtensions")
-nm -D _build/release/presto_cpp/main/connectors/clp_plugin/libclp_connector.so | grep registerExtensions
-# Expected output: T registerExtensions
-
-# Check dependencies
-ldd _build/release/presto_cpp/main/connectors/clp_plugin/libclp_connector.so
-# clp-s should NOT appear in output (it's statically linked into the plugin)
-# Velox/Presto symbols show as "not found" (resolved at runtime by presto_server)
+# Check clp-s is statically linked (should NOT appear in ldd output)
+ldd libclp_connector.so | grep clp
+# Expected: no output (clp-s is embedded)
 ```
 
 ---
 
 ## Deployment
 
-### 1. Create Plugin Directory
+### For End Users
 
-```bash
-mkdir -p /opt/presto/plugins
-```
+1. **Build or download `presto_server`** from upstream Presto (with Part 1 merged)
 
-### 2. Copy Plugin
+2. **Download `libclp_connector.so`** from YScope
 
-```bash
-cp _build/release/presto_cpp/main/connectors/clp_plugin/libclp_connector.so \
-   /opt/presto/plugins/
-```
+3. **Create plugin directory and copy plugin:**
+   ```bash
+   mkdir -p /opt/presto/plugins
+   cp libclp_connector.so /opt/presto/plugins/
+   ```
 
-### 3. Configure Presto Worker
+4. **Configure Presto worker** - add to `config.properties`:
+   ```properties
+   plugin.dir=/opt/presto/plugins
+   ```
 
-Add to `config.properties`:
+5. **Create CLP catalog** - create `clp.properties`:
+   ```properties
+   connector.name=clp
+   clp.storage-type=FS
+   ```
 
-```properties
-plugin.dir=/opt/presto/plugins
-```
-
-### 4. Configure CLP Catalog
-
-Create `clp.properties` (same as before - no changes needed):
-
-```properties
-connector.name=clp
-clp.storage-type=FS
-# clp.s3-auth-provider=CLP_PACKAGE  # For S3 storage
-```
-
-### 5. Start Worker
-
-```bash
-./presto_server --etc-dir=/etc/presto
-```
+6. **Start worker:**
+   ```bash
+   ./presto_server --etc-dir=/etc/presto
+   ```
 
 ---
 
@@ -936,72 +1175,52 @@ clp.storage-type=FS
 ### Check Plugin Loaded
 
 Look for log messages during startup:
-
 ```
+INFO: Loading plugins from /opt/presto/plugins
 INFO: Loading plugin from /opt/presto/plugins/libclp_connector.so
-INFO: Registered connector: clp
+INFO: Successfully loaded plugin from /opt/presto/plugins/libclp_connector.so
 ```
 
 ### Test Query
 
 ```sql
--- Connect to Presto
-presto-cli --server localhost:8080
-
--- Use CLP catalog
 USE clp.default;
-
--- List tables
 SHOW TABLES;
-
--- Query data
 SELECT * FROM logs LIMIT 10;
-
--- Test KQL filter pushdown
-SELECT * FROM logs WHERE level = 'ERROR' LIMIT 10;
 ```
 
 ### Troubleshooting
 
 | Issue | Cause | Solution |
 |-------|-------|----------|
-| Plugin not loaded | Wrong path | Check `plugin.dir` configuration |
-| Symbol not found | ABI mismatch | Rebuild plugin with same compiler as presto_server |
-| `registerExtensions` not found | Missing extern "C" | Verify function has `extern "C"` linkage |
-| clp-s errors | Missing static link | Verify clp-s is statically linked (check `ldd` output) |
-| Type conversion errors | Protocol mismatch | Ensure Java and C++ protocol types match |
+| "No plugin directory configured" | `plugin.dir` not set | Add `plugin.dir=/path/to/plugins` to config.properties |
+| "Failed to load plugin: cannot open shared object" | Missing dependencies | Check `ldd libclp_connector.so` for missing libs |
+| "missing registerExtensions" | Wrong symbol name or missing extern "C" | Verify `nm -D libclp_connector.so \| grep registerExtensions` shows `T registerExtensions` |
+| Connector not found | Plugin loaded but registration failed | Check logs for errors after "Loading plugin" |
 
 ---
 
 ## Summary
 
-Converting the Velox CLP Connector to a plugin involves:
+### Current State
 
-| Step | Description | Repository |
-|------|-------------|------------|
-| 1 | **Create** plugin directory with entry point and CMakeLists | **[PRESTO]** |
-| 2 | **Extract** `ClpPrestoToVeloxConnector` bridge class to standalone files | **[PRESTO]** |
-| 3 | **Build** shared library with static clp-s linking and OBJECT library handling | **[PRESTO]** (references **[VELOX]**) |
-| 4 | **Remove** CLP from static registration and linking in presto_server | **[PRESTO]** |
-| 5 | **Deploy** `.so` file to plugin directory | Deployment |
-| 6 | **Configure** `plugin.dir` in Presto worker config | Deployment |
+**Plugin loading does NOT exist in Presto today.** You must:
+1. Implement Part 1 (plugin loading infrastructure)
+2. Submit PR to upstream `prestodb/presto`
+3. Wait for it to be merged
+4. Then Part 2 (CLP plugin) becomes usable
 
-### Repository Breakdown
+### Ownership
 
-**[PRESTO] Changes (Submit to `prestodb/presto` for review):**
-- All new files in `presto_cpp/main/connectors/clp_plugin/`
-- Modifications to `Registration.cpp`, `PrestoToVeloxConnector.h/cpp`, `CMakeLists.txt` files
-- Modifications to `presto_protocol.cpp`
+| What | Where | Who Maintains | Status |
+|------|-------|---------------|--------|
+| Plugin loading infrastructure | Upstream Presto (`prestodb/presto`) | Presto community (after your PR) | **Must be implemented** |
+| `libclp_connector.so` | YScope distribution | YScope (private) | After Part 1 merges |
+| Velox CLP Connector source | YScope Velox fork | YScope (private) | Existing |
 
-**[VELOX] Dependencies (Private repo - no upstream changes needed):**
-- `velox/velox/connectors/clp/` - Velox CLP connector (compiled into plugin)
-- `velox/velox/connectors/clp/search_lib/` - CLP search library (compiled into plugin)
-- clp-s libraries (statically linked into plugin)
+### End-user Workflow (After Part 1 is Merged)
 
-### Plugin Architecture
-
-The plugin is self-contained:
-- clp-s is statically linked into the plugin
-- Velox CLP connector code is compiled into the plugin
-- Protocol serialization code is compiled into the plugin
-- Velox/Presto symbols (e.g., `registerPrestoToVeloxConnector()`) are resolved at runtime when loaded by `presto_server`
+1. Build `presto_server` from stock upstream Presto
+2. Download `libclp_connector.so` from YScope
+3. Set `plugin.dir=/opt/presto/plugins` in config
+4. Run `./presto_server`
