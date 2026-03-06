@@ -27,7 +27,12 @@ ENV BUILD_DIR=""
 RUN mkdir -p /prestissimo /runtime-libraries
 COPY . /prestissimo/
 RUN --mount=type=cache,target=/root/.ccache,sharing=locked \
-    /bin/bash -c 'if [[ "${EXTRA_CMAKE_FLAGS}" =~ -DPRESTO_ENABLE_CUDF=ON ]]; then unset CC; unset CXX; source /opt/rh/gcc-toolset-14/enable; fi && \
+    /bin/bash -c 'if [[ "${EXTRA_CMAKE_FLAGS}" =~ -DPRESTO_ENABLE_CUDF=ON ]]; then unset CC; unset CXX; source /opt/rh/gcc-toolset-14/enable; \
+    elif command -v clang++-17 &>/dev/null; then \
+      export CC=/usr/bin/clang-17; \
+      export CXX=/usr/bin/clang++-17; \
+      EXTRA_CMAKE_FLAGS="${EXTRA_CMAKE_FLAGS} -DCMAKE_EXE_LINKER_FLAGS=-fuse-ld=lld-17 -DCMAKE_SHARED_LINKER_FLAGS=-fuse-ld=lld-17"; \
+    fi && \
     EXTRA_CMAKE_FLAGS=${EXTRA_CMAKE_FLAGS} \
     NUM_THREADS=${NUM_THREADS} make --directory="/prestissimo/" cmake-and-build BUILD_TYPE=${BUILD_TYPE} BUILD_DIR=${BUILD_DIR} BUILD_BASE_DIR=${BUILD_BASE_DIR} && \
     ccache -sz -v'

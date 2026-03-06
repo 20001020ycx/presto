@@ -43,3 +43,9 @@ RUN mkdir build && \
                  ../velox/scripts/setup-ubuntu.sh install_adapters && \
                  ../scripts/setup-adapters.sh ) && \
     rm -rf build
+
+# Install clang-17 and lld-17 to avoid GCC codegen bugs with proxygen in
+# release builds. See: https://github.com/prestodb/presto/issues/22995
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    clang-17 lld-17 && \
+    apt-get clean && rm -rf /var/lib/apt/lists/*
