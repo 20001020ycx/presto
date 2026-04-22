@@ -292,7 +292,17 @@ void to_json(json& j, const std::shared_ptr<ExecutionWriterTarget>& p);
 void from_json(const json& j, std::shared_ptr<ExecutionWriterTarget>& p);
 } // namespace facebook::presto::protocol
 namespace facebook::presto::protocol {
-struct ConnectorPartitioningHandle : public JsonEncodedSubclass {};
+struct ConnectorPartitioningHandle : public JsonEncodedSubclass {
+  static std::string serialize(ConnectorPartitioningHandle& p) {
+    VELOX_NYI("Serialization not implemented for ConnectorPartitioningHandle");
+  }
+  static std::shared_ptr<ConnectorPartitioningHandle> deserialize(
+      const std::string& data,
+      std::shared_ptr<ConnectorPartitioningHandle> p) {
+    VELOX_NYI(
+        "Deserialization not implemented for ConnectorPartitioningHandle");
+  }
+};
 void to_json(json& j, const std::shared_ptr<ConnectorPartitioningHandle>& p);
 void from_json(const json& j, std::shared_ptr<ConnectorPartitioningHandle>& p);
 } // namespace facebook::presto::protocol
@@ -307,7 +317,16 @@ void to_json(json& j, const std::shared_ptr<ValueSet>& p);
 void from_json(const json& j, std::shared_ptr<ValueSet>& p);
 } // namespace facebook::presto::protocol
 namespace facebook::presto::protocol {
-struct ConnectorIndexHandle : public JsonEncodedSubclass {};
+struct ConnectorIndexHandle : public JsonEncodedSubclass {
+  static std::string serialize(ConnectorIndexHandle& p) {
+    VELOX_NYI("Serialization not implemented for ConnectorIndexHandle");
+  }
+  static std::shared_ptr<ConnectorIndexHandle> deserialize(
+      const std::string& data,
+      std::shared_ptr<ConnectorIndexHandle> p) {
+    VELOX_NYI("Deserialization not implemented for ConnectorIndexHandle");
+  }
+};
 void to_json(json& j, const std::shared_ptr<ConnectorIndexHandle>& p);
 void from_json(const json& j, std::shared_ptr<ConnectorIndexHandle>& p);
 } // namespace facebook::presto::protocol
@@ -315,6 +334,14 @@ namespace facebook::presto::protocol {
 struct ColumnHandle : public JsonEncodedSubclass {
   virtual bool operator<(const ColumnHandle& /* o */) const {
     throw std::runtime_error("missing operator<() in ColumnHandle subclass");
+  }
+  static std::string serialize(ColumnHandle& p) {
+    VELOX_NYI("Serialization not implemented for ColumnHandle");
+  }
+  static std::shared_ptr<ColumnHandle> deserialize(
+      const std::string& data,
+      std::shared_ptr<ColumnHandle> p) {
+    VELOX_NYI("Deserialization not implemented for ColumnHandle");
   }
 };
 void to_json(json& j, const std::shared_ptr<ColumnHandle>& p);
