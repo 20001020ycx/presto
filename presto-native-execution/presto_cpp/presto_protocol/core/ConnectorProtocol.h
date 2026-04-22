@@ -222,7 +222,7 @@ class ConnectorProtocolTemplate final : public ConnectorProtocol {
   void deserialize(
       const std::string& thrift,
       std::shared_ptr<ColumnHandle>& proto) const final {
-    deserializeTemplate<ColumnHandleType>(thrift, proto);
+    ColumnHandle::deserialize(thrift, proto);
   }
 
   void to_json(json& j, const std::shared_ptr<ConnectorInsertTableHandle>& p)
