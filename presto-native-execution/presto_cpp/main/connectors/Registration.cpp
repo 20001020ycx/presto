@@ -38,6 +38,48 @@ constexpr char const* kIcebergConnectorName = "iceberg";
 
 } // namespace
 
+namespace detail {
+
+std::unordered_map<std::string, std::shared_ptr<ConnectorFactory>>&
+connectorFactories() {
+  static std::unordered_map<std::string, std::shared_ptr<ConnectorFactory>>
+      factories;
+  return factories;
+}
+
+} // namespace detail
+
+bool registerConnectorFactory(
+    std::shared_ptr<ConnectorFactory> factory) {
+  const bool ok = detail::connectorFactories()
+                      .insert({factory->connectorName(), factory})
+                      .second;
+  VELOX_CHECK(
+      ok,
+      "ConnectorFactory with name '{}' is already registered",
+      factory->connectorName());
+  return true;
+}
+
+bool hasConnectorFactory(const std::string& connectorName) {
+  return detail::connectorFactories().count(connectorName) == 1;
+}
+
+bool unregisterConnectorFactory(const std::string& connectorName) {
+  const auto count = detail::connectorFactories().erase(connectorName);
+  return count == 1;
+}
+
+std::shared_ptr<ConnectorFactory> getConnectorFactory(
+    const std::string& connectorName) {
+  auto it = detail::connectorFactories().find(connectorName);
+  VELOX_CHECK(
+      it != detail::connectorFactories().end(),
+      "ConnectorFactory with name '{}' not registered",
+      connectorName);
+  return it->second;
+}
+
 std::vector<std::string> listConnectorFactories() {
   std::vector<std::string> names;
   const auto& factories = detail::connectorFactories();

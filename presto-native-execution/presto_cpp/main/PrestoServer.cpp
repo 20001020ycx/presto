@@ -303,6 +303,11 @@ void PrestoServer::run() {
   initializeVeloxMemory();
   initializeThreadPools();
 
+  // Load dynamic plugins before processing catalogs so that plugin-registered
+  // connector factories are available when catalog .properties files
+  // reference them.
+  registerDynamicFunctions();
+
   auto catalogNames = registerVeloxConnectors(fs::path(configDirectoryPath_));
 
   initializeHttpServer();
@@ -314,7 +319,6 @@ void PrestoServer::run() {
   registerVectorSerdes();
   registerPrestoPlanNodeSerDe();
   registerTraceNodeFactories();
-  registerDynamicFunctions();
   registerExchangeSources();
 
   initializeTaskResources();
